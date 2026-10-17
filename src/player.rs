@@ -8,13 +8,13 @@
 //! is doing.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
-    Spirc,
+    QueueList, Spirc,
 };
 use librespot_core::{
     SpotifyUri,
@@ -37,6 +37,7 @@ use librespot_playback::{
     player::{Player, PlayerEvent},
 };
 use sha1::{Digest, Sha1};
+use tokio::sync::watch;
 
 use crate::api::models::ArtistRef;
 use crate::sink::{AudioControl, ErrorHook, RodioSink};
@@ -437,6 +438,13 @@ impl Engine {
             }
         });
 
+        tokio::spawn(preload_next_song(
+            Arc::downgrade(&player),
+            player.get_player_event_channel(),
+            spirc.watch_queue_list(),
+            Arc::clone(&state),
+        ));
+
         Ok(Self {
             player,
             spirc: Arc::new(spirc),
@@ -667,6 +675,43 @@ fn command_interrupts_audio(state: &LocalState, command: &PlayerCommand) -> bool
         )
 }
 
+/// How close a song must be to its end before the next one is loaded ahead.
+/// Loading downloads the whole song, so this keeps a long item from fetching
+/// its successor hours early.
+const PRELOAD_HORIZON_MS: u32 = 5 * 60 * 1000;
+
+/// The song to load ahead of a skip, if any: a song that is playing close to
+/// its end with a song queued after it, and not repeating. It is the song
+/// librespot's own preload picks, just asked for earlier. Episodes are left
+/// alone, since one can be an hour of audio.
+fn track_to_preload(state: &LocalState, next_tracks: &[String]) -> Option<SpotifyUri> {
+    let track = state.track.as_ref()?;
+    let remaining = track.duration_ms.saturating_sub(state.position_now());
+    if state.playback != Playback::Playing
+        || state.repeat == RepeatMode::Track
+        || remaining > PRELOAD_HORIZON_MS
+    {
+        return None;
+    }
+    let next = SpotifyUri::from_uri(next_tracks.first()?).ok()?;
+    matches!(next, SpotifyUri::Track { .. }).then_some(next)
+}
+
+/// What to ask librespot to load now, noted in `asked` so each song is asked
+/// for once per play of the current one. `track_sequence` counts the plays: it
+/// also changes when the same song is loaded again, which empties the slot.
+fn preload_request(
+    state: &LocalState,
+    next_tracks: &[String],
+    asked: &mut Option<(u64, SpotifyUri)>,
+) -> Option<SpotifyUri> {
+    let key = (state.track_sequence, track_to_preload(state, next_tracks)?);
+    if asked.as_ref() == Some(&key) {
+        return None;
+    }
+    Some(asked.insert(key).1.clone())
+}
+
 /// The librespot backend a saved setting names, when this build has it.
 ///
 /// Spotifast's own output has always been saved as "rodio". librespot's
@@ -816,6 +861,38 @@ async fn run_events(
         };
         if let Some(snapshot) = snapshot {
             notify(EngineEvent::State(snapshot));
+        }
+    }
+}
+
+/// Loads the next song ahead of time, so skipping to it starts at once.
+///
+/// librespot does this only 30 seconds before a song ends; until then Next
+/// waits for a cold load. This asks for the same song earlier, from the queue
+/// Spirc will skip into (#927). Asking again for a song already loaded does
+/// nothing, and librespot's own request replaces ours if the two ever differ.
+/// It holds the player weakly, so a replaced engine is not kept alive.
+async fn preload_next_song(
+    player: Weak<Player>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
+    mut queue: watch::Receiver<QueueList>,
+    state: Arc<Mutex<LocalState>>,
+) {
+    let mut asked = None;
+    loop {
+        tokio::select! {
+            changed = queue.changed() => if changed.is_err() { return },
+            event = events.recv() => if event.is_none() { return },
+        }
+        let next = {
+            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            preload_request(&state, &queue.borrow().next_tracks, &mut asked)
+        };
+        if let Some(uri) = next {
+            let Some(player) = player.upgrade() else {
+                return;
+            };
+            player.preload(uri);
         }
     }
 }
@@ -1590,6 +1667,135 @@ mod tests {
             &playing,
             &PlayerCommand::Seek(10)
         ));
+    }
+
+    const NEXT_SONG: &str = "spotify:track:6rqhFgbbKwnb9MLmUQDhG6";
+
+    fn playing_song(position_ms: u32, duration_ms: u32) -> LocalState {
+        LocalState {
+            playback: Playback::Playing,
+            position_ms,
+            track: Some(LocalTrack {
+                duration_ms,
+                ..LocalTrack::default()
+            }),
+            ..LocalState::default()
+        }
+    }
+
+    fn queued(uri: &str) -> Vec<String> {
+        vec![uri.to_string()]
+    }
+
+    /// librespot loads the next song 30 seconds before the end, so a skip
+    /// earlier than that waits for a cold load. An ordinary song is well
+    /// inside the horizon from its first second.
+    #[test]
+    fn the_next_song_is_loaded_ahead_from_the_start_of_an_ordinary_song() {
+        let next = track_to_preload(&playing_song(0, 4 * 60 * 1000), &queued(NEXT_SONG));
+        assert_eq!(next, Some(SpotifyUri::from_uri(NEXT_SONG).unwrap()));
+    }
+
+    /// Loading a song downloads all of it, so a long item must not fetch
+    /// the next song hours before anyone hears it.
+    #[test]
+    fn nothing_is_loaded_ahead_until_the_song_is_within_five_minutes_of_its_end() {
+        let queue = queued(NEXT_SONG);
+        assert!(track_to_preload(&playing_song(0, PRELOAD_HORIZON_MS), &queue).is_some());
+        assert!(track_to_preload(&playing_song(0, PRELOAD_HORIZON_MS + 1), &queue).is_none());
+        let two_hours = 2 * 60 * 60 * 1000;
+        assert!(track_to_preload(&playing_song(0, two_hours), &queue).is_none());
+        assert!(track_to_preload(&playing_song(two_hours - 60_000, two_hours), &queue).is_some());
+    }
+
+    #[test]
+    fn nothing_is_loaded_ahead_while_paused() {
+        let mut state = playing_song(0, 4 * 60 * 1000);
+        state.playback = Playback::Paused;
+        assert!(track_to_preload(&state, &queued(NEXT_SONG)).is_none());
+    }
+
+    /// librespot's own preload names the current song when it repeats, and
+    /// loading that is a no-op. Loading a different song would only waste it.
+    #[test]
+    fn nothing_is_loaded_ahead_while_repeating_one_song() {
+        let mut state = playing_song(0, 4 * 60 * 1000);
+        state.repeat = RepeatMode::Track;
+        assert!(track_to_preload(&state, &queued(NEXT_SONG)).is_none());
+    }
+
+    /// An episode can be an hour of audio, and the queue can hold entries
+    /// that are not playable songs at all.
+    #[test]
+    fn only_songs_are_loaded_ahead() {
+        let state = playing_song(0, 4 * 60 * 1000);
+        for uri in [
+            "spotify:episode:512ojhOuo1ktJprKbVcKyQ",
+            "spotify:delimiter",
+            "not a uri",
+        ] {
+            assert!(track_to_preload(&state, &queued(uri)).is_none(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_loaded_ahead_when_no_song_is_next() {
+        assert!(track_to_preload(&playing_song(0, 4 * 60 * 1000), &[]).is_none());
+    }
+
+    const OTHER_SONG: &str = "spotify:track:0VjIjW4GlUZAMYd2vXMi3b";
+
+    /// The engine reports every second. Asking librespot each time would wake
+    /// its player thread for nothing, and a song that cannot load would be
+    /// fetched again every second.
+    #[test]
+    fn a_song_is_asked_for_once_while_the_same_song_plays() {
+        let state = playing_song(0, 4 * 60 * 1000);
+        let queue = queued(NEXT_SONG);
+        let mut asked = None;
+        assert!(preload_request(&state, &queue, &mut asked).is_some());
+        assert!(preload_request(&state, &queue, &mut asked).is_none());
+    }
+
+    /// Loading a song empties librespot's preload slot, even when it is the
+    /// song already playing. If that leaves the same song queued next, the
+    /// slot is still empty and has to be filled again.
+    #[test]
+    fn the_next_song_is_asked_for_again_when_the_current_one_is_loaded_again() {
+        let mut state = playing_song(0, 4 * 60 * 1000);
+        let queue = queued(NEXT_SONG);
+        let mut asked = None;
+        assert!(preload_request(&state, &queue, &mut asked).is_some());
+        state.track_sequence += 1;
+        assert_eq!(
+            preload_request(&state, &queue, &mut asked),
+            Some(SpotifyUri::from_uri(NEXT_SONG).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_different_next_song_is_asked_for() {
+        let state = playing_song(0, 4 * 60 * 1000);
+        let mut asked = None;
+        assert!(preload_request(&state, &queued(NEXT_SONG), &mut asked).is_some());
+        assert_eq!(
+            preload_request(&state, &queued(OTHER_SONG), &mut asked),
+            Some(SpotifyUri::from_uri(OTHER_SONG).unwrap())
+        );
+    }
+
+    /// A pause leaves the loaded song in librespot's slot, so resuming has
+    /// nothing to ask for.
+    #[test]
+    fn pausing_and_resuming_does_not_ask_again() {
+        let mut state = playing_song(0, 4 * 60 * 1000);
+        let queue = queued(NEXT_SONG);
+        let mut asked = None;
+        assert!(preload_request(&state, &queue, &mut asked).is_some());
+        state.playback = Playback::Paused;
+        assert!(preload_request(&state, &queue, &mut asked).is_none());
+        state.playback = Playback::Playing;
+        assert!(preload_request(&state, &queue, &mut asked).is_none());
     }
 
     /// Spotify making this Connect device inactive must not be mistaken for

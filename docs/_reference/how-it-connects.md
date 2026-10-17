@@ -476,6 +476,17 @@ This uses the existing playback session's Connect transfer request and needs
 no additional authorization. An old or unavailable Web API playback snapshot
 does not cause the previous local song to restart or replace the remote queue.
 
+Local playback loads the song that follows the playing one before Next is
+pressed, so skipping to it starts at once. Librespot does this itself 30
+seconds before a song ends; Spotifast asks for the same song once 5 minutes
+or less of the playing one remain, which is from the start of an ordinary
+song. Loading fetches the song's details, its audio key and its audio file
+from Spotify's servers, the requests librespot makes at the 30-second mark,
+only earlier. The file is downloaded in full, so a song you skip past before
+it plays costs one download. Nothing is loaded ahead while paused or
+repeating one song, and episodes are never loaded ahead. This adds no
+destination and no background polling.
+
 When the PulseAudio backend is selected on Linux, its PulseAudio or PipeWire
 stream is named **Spotifast**, with **Spotify playback** as its description, so
 system mixers and audio processors can identify and route it. Explicit
